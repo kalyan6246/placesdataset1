@@ -3,6 +3,7 @@ import json
 import os
 from google.cloud import bigquery
 from datetime import date
+import threading
 
 app = Flask(__name__)
 
@@ -32,10 +33,10 @@ def load_geojson_into_bq(geojson_data):
     dataset_ref = bq_client.dataset(BQ_DATASET)
     table_ref = dataset_ref.table(BQ_TABLE)
 
-    # Convert GeoJSON features to rows
     rows_to_insert = []
+
     for feat in geojson_data.get("features", []):
-        props = feat.get("properties", {}).copy()  # Copy to avoid modifying original
+        props = feat.get("properties", {}).copy()
         geom = feat.get("geometry", {})
         coords = geom.get("coordinates", [None, None])
         lon, lat = coords if len(coords) == 2 else (None, None)
@@ -43,14 +44,15 @@ def load_geojson_into_bq(geojson_data):
         props["lon"] = lon
         props["lat"] = lat
         props["ingestion_date"] = date.today().isoformat()
+
         rows_to_insert.append(props)
 
     if not rows_to_insert:
         print("No rows to insert into BigQuery.")
         return False
 
-    # Insert into BigQuery
     errors = bq_client.insert_rows_json(table_ref, rows_to_insert)
+
     if errors:
         print("BigQuery insert errors:", errors)
         return False
@@ -58,25 +60,39 @@ def load_geojson_into_bq(geojson_data):
     print(f"Inserted {len(rows_to_insert)} rows into {BQ_DATASET}.{BQ_TABLE}")
     return True
 
+
 # -------------------------------
-# AUTO LOAD ON STARTUP
+# BACKGROUND LOAD (Cloud Run Safe)
 # -------------------------------
-print("Loading GeoJSON into BigQuery on startup...")
-load_geojson_into_bq(geojson_data)
+def async_load_bq():
+    print("Starting background BigQuery load...")
+    success = load_geojson_into_bq(geojson_data)
+    if success:
+        print("BigQuery load completed successfully.")
+    else:
+        print("BigQuery load failed.")
+
+
+# Start BigQuery loading in background thread
+threading.Thread(target=async_load_bq, daemon=True).start()
+
 
 # -------------------------------
 # FLASK ENDPOINTS
 # -------------------------------
 @app.route("/geojson")
 def geojson():
-    """Return the GeoJSON for the map"""
     return jsonify(geojson_data)
+
 
 @app.route("/")
 def map_view():
-    """Render map using Leaflet"""
     return render_template("map.html")
 
+
+# -------------------------------
+# START SERVER
+# -------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
