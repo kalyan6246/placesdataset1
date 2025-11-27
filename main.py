@@ -5,16 +5,16 @@ from datetime import datetime, date
 import requests
 from shapely.geometry import shape, Point
 from google.cloud import storage, secretmanager, bigquery
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template_string
 import threading
 
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
 PROJECT_ID = os.environ.get('GCP_PROJECT') or os.environ.get('PROJECT_ID')
-BUCKET_NAME = os.environ.get('PLACES_BUCKET') or 'PROJECT_BUCKET'
+BUCKET_NAME = os.environ.get('PLACES_BUCKET') or 'mvmu'  # bucket name
 GCS_PREFIX = os.environ.get('GCS_PREFIX') or 'places_exports'
-MAHARAJSHA_FILE = os.environ.get('MAHARAJ_SHA_GEOJSON') or 'mvmu/NVMB.geojson'
+MAHARAJSHA_FILE = os.environ.get('MAHARAJ_SHA_GEOJSON') or 'NVMB.geojson'  # file path in bucket
 SECRET_NAME = os.environ.get('API_KEY_SECRET') or f"projects/{PROJECT_ID}/secrets/PLACES_API_KEY/versions/1"
 
 GRID_STEP_DEG = float(os.environ.get('GRID_STEP_DEG') or 0.0005)
@@ -265,6 +265,43 @@ def trigger_job():
     thread = threading.Thread(target=run_job)
     thread.start()
     return jsonify({"status": "Job started"}), 200
+
+@app.get("/geojson")
+def serve_geojson():
+    """Serve the NVMB.geojson from GCS"""
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(MAHARAJSHA_FILE)
+    geojson_text = blob.download_as_text(encoding="utf-8-sig")
+    return jsonify(json.loads(geojson_text))
+
+@app.get("/map")
+def show_map():
+    """Render a map using Leaflet and GeoJSON from GCS"""
+    map_html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Maharashtra POIs Map</title>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    </head>
+    <body>
+      <h3>Maharashtra POIs Map</h3>
+      <div id="map" style="width: 100%; height: 600px;"></div>
+      <script>
+        var map = L.map('map').setView([19.2, 72.9], 7);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {}).addTo(map);
+
+        fetch('/geojson')
+          .then(res => res.json())
+          .then(data => L.geoJSON(data).addTo(map));
+      </script>
+    </body>
+    </html>
+    """
+    return render_template_string(map_html)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
