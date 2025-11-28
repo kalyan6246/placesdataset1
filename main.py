@@ -1,170 +1,127 @@
-from flask import Flask, jsonify, render_template
-import json
+# main.py
 import os
+import json
+import traceback
+from flask import Flask, request, jsonify
+from shapely.geometry import shape, Point
 from google.cloud import bigquery
-from datetime import date
 
 app = Flask(__name__)
 
-# -------------------------------
+# -------------------------------------------------------------------
 # CONFIG
-# -------------------------------
-GEOJSON_PATH = os.path.join(os.path.dirname(__file__), "NVMB.geojson")
+# -------------------------------------------------------------------
+PROJECT_ID = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID")
+DATASET_ID = "places_dataset"
+TABLE_ID = "places"
 
-BQ_PROJECT = os.environ.get("GCP_PROJECT")
-BQ_DATASET = os.environ.get("BQ_DATASET", "places_dataset")
-BQ_TABLE = os.environ.get("BQ_TABLE", "maharashtra_pois")
+# Path to the GeoJSON stored inside your Git repo
+REPO_GEOJSON_PATH = "data/places_polygon.geojson"
 
-# -------------------------------
-# LOAD GEOJSON SAFELY
-# -------------------------------
-geojson_data = None
 
-try:
-    print(f"Loading NVMB.geojson from: {GEOJSON_PATH}")
-    with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
-        geojson_data = json.load(f)
-
-    print("Loaded GeoJSON features:", len(geojson_data.get("features", [])))
-except Exception as e:
-    print("ERROR loading NVMB.geojson:", e)
-    geojson_data = {"type": "FeatureCollection", "features": []}
-
-# -------------------------------
-# BIGQUERY HELPER
-# -------------------------------
-def get_bq_client():
+# -------------------------------------------------------------------
+# READ GEOJSON FILE FROM REPO
+# -------------------------------------------------------------------
+def load_polygon_from_repo():
     try:
-        return bigquery.Client()
+        with open(REPO_GEOJSON_PATH, "r") as f:
+            gj = json.load(f)
+        polygon = shape(gj["features"][0]["geometry"])
+        return polygon
     except Exception as e:
-        print("BigQuery client init error:", e)
+        print("❌ Error reading GeoJSON from repo:", e)
+        traceback.print_exc()
         return None
 
 
-# -------------------------------
-# CREATE DATASET + TABLE IF MISSING
-# -------------------------------
-def ensure_bigquery():
-    client = get_bq_client()
-    if not client:
-        return False
+# -------------------------------------------------------------------
+# BIGQUERY CLIENT
+# -------------------------------------------------------------------
+bq_client = bigquery.Client()
 
-    dataset_id = f"{BQ_PROJECT}.{BQ_DATASET}"
-    table_id = f"{dataset_id}.{BQ_TABLE}"
 
-    # 1️⃣ Ensure dataset exists
+# -------------------------------------------------------------------
+# ROUTE: TEST BIGQUERY CONNECTION
+# -------------------------------------------------------------------
+@app.route("/bqtest")
+def bq_test():
     try:
-        client.get_dataset(dataset_id)
-        print("Dataset exists:", dataset_id)
-    except:
-        dataset = bigquery.Dataset(dataset_id)
-        client.create_dataset(dataset)
-        print("Created dataset:", dataset_id)
-
-    # 2️⃣ Ensure table exists
-    schema = [
-        bigquery.SchemaField("name", "STRING"),
-        bigquery.SchemaField("type", "STRING"),
-        bigquery.SchemaField("ingestion_date", "DATE"),
-        bigquery.SchemaField("geometry", "GEOGRAPHY"),
-    ]
-
-    try:
-        client.get_table(table_id)
-        print("Table exists:", table_id)
-    except:
-        table = bigquery.Table(table_id, schema=schema)
-        client.create_table(table)
-        print("Created table:", table_id)
-
-    return True
+        list(bq_client.list_datasets())
+        return jsonify({"status": "connected"})
+    except Exception as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
 
 
-# -------------------------------
-# INSERT POLYGONS INTO BIGQUERY
-# -------------------------------
-def insert_polygon_data():
-    client = get_bq_client()
-    if not client:
-        return False
-
-    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
-    rows = []
-
-    feats = geojson_data.get("features", [])
-    print("Preparing rows for BigQuery. Feature count:", len(feats))
-
-    for feat in feats:
-        geom = feat.get("geometry")
-        props = feat.get("properties", {})
-
-        if not geom:
-            continue
-
-        rows.append({
-            "name": props.get("name", "Polygon"),
-            "type": props.get("type", "boundary"),
-            "ingestion_date": date.today().isoformat(),
-            "geometry": json.dumps(geom)  # BigQuery GEOGRAPHY accepts JSON text
-        })
-
-    if not rows:
-        print("No rows extracted for BigQuery insert.")
-        return False
-
-    errors = client.insert_rows_json(table_id, rows)
-
-    if errors:
-        print("BigQuery INSERT ERRORS:", errors)
-        return False
-
-    print(f"Inserted {len(rows)} polygon rows to {table_id}")
-    return True
-
-
-# -------------------------------
-# API ROUTES
-# -------------------------------
+# -------------------------------------------------------------------
+# ROUTE: VISUALIZE GEOJSON (NO /map REQUIRED)
+# -------------------------------------------------------------------
 @app.route("/")
-def index():
-    return render_template("map.html")
+def root():
+    return jsonify({"message": "Service is running"})
 
 
 @app.route("/geojson")
-def serve_geojson():
-    """
-    This route serves NVMB.geojson to the Leaflet map.
-    """
-    print("Serving /geojson. Features:", len(geojson_data.get("features", [])))
-    return jsonify(geojson_data)
-
-
-@app.route("/load")
-def load_data():
-    """
-    Manual trigger:
-    Creates dataset + table + loads geojson into BigQuery.
-    """
-    ok1 = ensure_bigquery()
-    ok2 = insert_polygon_data()
-    return jsonify({
-        "dataset_and_table_ready": ok1,
-        "polygon_data_uploaded": ok2
-    })
-
-
-@app.route("/bq-test")
-def bq_test():
+def return_geojson():
     try:
-        client = bigquery.Client()
-        return jsonify({"status": "connected"})
+        with open(REPO_GEOJSON_PATH, "r") as f:
+            data = json.load(f)
+        return jsonify(data)
     except Exception as e:
-        return jsonify({"status": "error", "details": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 
-# -------------------------------
-# RUN SERVER
-# -------------------------------
+# -------------------------------------------------------------------
+# ROUTE: LOAD POINTS INTO BIGQUERY
+# -------------------------------------------------------------------
+@app.route("/load", methods=["POST"])
+def load_data_to_bigquery():
+    try:
+        req = request.json
+        if not req:
+            return jsonify({"error": "Missing JSON payload"}), 400
+
+        lat = req.get("lat")
+        lon = req.get("lon")
+        place_id = req.get("place_id", "unknown")
+
+        if lat is None or lon is None:
+            return jsonify({"error": "lat and lon required"}), 400
+
+        # Load polygon
+        polygon = load_polygon_from_repo()
+        if polygon is None:
+            return jsonify({"error": "Polygon not loaded"}), 500
+
+        pt = Point(lon, lat)
+        inside = polygon.contains(pt)
+
+        # Prepare BigQuery row
+        table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+        table = bq_client.get_table(table_ref)
+
+        rows_to_insert = [{
+            "place_id": place_id,
+            "latitude": lat,
+            "longitude": lon,
+            "inside_polygon": inside,
+        }]
+
+        errors = bq_client.insert_rows_json(table, rows_to_insert)
+
+        if errors:
+            print("❌ BigQuery insert errors:", errors)
+            return jsonify({"status": "error", "details": errors}), 500
+
+        return jsonify({"status": "success", "inside_polygon": inside})
+
+    except Exception as e:
+        print("❌ Exception in /load:", e)
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# -------------------------------------------------------------------
+# MAIN ENTRYPOINT
+# -------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=8080)
