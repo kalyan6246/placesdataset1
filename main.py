@@ -7,7 +7,7 @@ from datetime import date
 app = Flask(__name__)
 
 # -------------------------------
-# ENV VARS
+# CONFIG
 # -------------------------------
 GEOJSON_PATH = os.path.join(os.path.dirname(__file__), "NVMB.geojson")
 
@@ -18,46 +18,50 @@ BQ_TABLE = os.environ.get("BQ_TABLE", "maharashtra_pois")
 # -------------------------------
 # LOAD GEOJSON SAFELY
 # -------------------------------
+geojson_data = None
+
 try:
+    print(f"Loading NVMB.geojson from: {GEOJSON_PATH}")
     with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
         geojson_data = json.load(f)
+
+    print("Loaded GeoJSON features:", len(geojson_data.get("features", [])))
 except Exception as e:
     print("ERROR loading NVMB.geojson:", e)
     geojson_data = {"type": "FeatureCollection", "features": []}
 
-
 # -------------------------------
-# SAFE BIGQUERY CLIENT
+# BIGQUERY HELPER
 # -------------------------------
-def get_bq():
+def get_bq_client():
     try:
         return bigquery.Client()
     except Exception as e:
-        print("BigQuery Client Error:", e)
+        print("BigQuery client init error:", e)
         return None
 
 
 # -------------------------------
-# CREATE DATASET + TABLE
+# CREATE DATASET + TABLE IF MISSING
 # -------------------------------
-def ensure_bq():
-    client = get_bq()
-    if client is None:
+def ensure_bigquery():
+    client = get_bq_client()
+    if not client:
         return False
 
-    # Dataset
     dataset_id = f"{BQ_PROJECT}.{BQ_DATASET}"
-    dataset_ref = bigquery.Dataset(dataset_id)
+    table_id = f"{dataset_id}.{BQ_TABLE}"
 
+    # 1️⃣ Ensure dataset exists
     try:
-        client.get_dataset(dataset_ref)
+        client.get_dataset(dataset_id)
         print("Dataset exists:", dataset_id)
     except:
-        client.create_dataset(dataset_ref)
+        dataset = bigquery.Dataset(dataset_id)
+        client.create_dataset(dataset)
         print("Created dataset:", dataset_id)
 
-    # Table
-    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    # 2️⃣ Ensure table exists
     schema = [
         bigquery.SchemaField("name", "STRING"),
         bigquery.SchemaField("type", "STRING"),
@@ -69,91 +73,98 @@ def ensure_bq():
         client.get_table(table_id)
         print("Table exists:", table_id)
     except:
-        table_obj = bigquery.Table(table_id, schema=schema)
-        client.create_table(table_obj)
+        table = bigquery.Table(table_id, schema=schema)
+        client.create_table(table)
         print("Created table:", table_id)
 
     return True
 
 
 # -------------------------------
-# INSERT GEOJSON POLYGONS
+# INSERT POLYGONS INTO BIGQUERY
 # -------------------------------
-def insert_geojson():
-    client = get_bq()
-    if client is None:
+def insert_polygon_data():
+    client = get_bq_client()
+    if not client:
         return False
 
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
     rows = []
 
-    print("Preparing rows for BigQuery insert...")
+    feats = geojson_data.get("features", [])
+    print("Preparing rows for BigQuery. Feature count:", len(feats))
 
-    for feature in geojson_data.get("features", []):
-        geom = feature.get("geometry")
-        props = feature.get("properties", {})
+    for feat in feats:
+        geom = feat.get("geometry")
+        props = feat.get("properties", {})
 
         if not geom:
             continue
 
         rows.append({
             "name": props.get("name", "Polygon"),
-            "type": props.get("type", "polygon"),
+            "type": props.get("type", "boundary"),
             "ingestion_date": date.today().isoformat(),
-            "geometry": json.dumps(geom)  # GEOGRAPHY accepts JSON
+            "geometry": json.dumps(geom)  # BigQuery GEOGRAPHY accepts JSON text
         })
 
-    print("ROWS:", rows)
-
     if not rows:
-        print("No rows to insert.")
+        print("No rows extracted for BigQuery insert.")
         return False
 
     errors = client.insert_rows_json(table_id, rows)
 
     if errors:
-        print("BigQuery insert ERRORS:", errors)
+        print("BigQuery INSERT ERRORS:", errors)
         return False
 
-    print(f"Inserted {len(rows)} polygon rows into {table_id}")
+    print(f"Inserted {len(rows)} polygon rows to {table_id}")
     return True
 
 
 # -------------------------------
-# TEST ROUTES
+# API ROUTES
 # -------------------------------
-@app.route("/bq-test")
-def bq_test():
-    try:
-        client = bigquery.Client()
-        datasets = [d.dataset_id for d in client.list_datasets()]
-        return jsonify({"bq": "connected", "datasets": datasets})
-    except Exception as e:
-        return jsonify({"bq": "error", "details": str(e)}), 500
-
-
-@app.route("/load")
-def load():
-    ok1 = ensure_bq()
-    ok2 = insert_geojson()
-    return jsonify({"dataset_created": ok1, "inserted": ok2})
-
-
-# -------------------------------
-# MAIN ROUTES
-# -------------------------------
-@app.route("/geojson")
-def get_geojson():
-    return jsonify(geojson_data)
-
-
 @app.route("/")
 def index():
     return render_template("map.html")
 
 
+@app.route("/geojson")
+def serve_geojson():
+    """
+    This route serves NVMB.geojson to the Leaflet map.
+    """
+    print("Serving /geojson. Features:", len(geojson_data.get("features", [])))
+    return jsonify(geojson_data)
+
+
+@app.route("/load")
+def load_data():
+    """
+    Manual trigger:
+    Creates dataset + table + loads geojson into BigQuery.
+    """
+    ok1 = ensure_bigquery()
+    ok2 = insert_polygon_data()
+    return jsonify({
+        "dataset_and_table_ready": ok1,
+        "polygon_data_uploaded": ok2
+    })
+
+
+@app.route("/bq-test")
+def bq_test():
+    try:
+        client = bigquery.Client()
+        return jsonify({"status": "connected"})
+    except Exception as e:
+        return jsonify({"status": "error", "details": str(e)}), 500
+
+
 # -------------------------------
-# START SERVER
+# RUN SERVER
 # -------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
